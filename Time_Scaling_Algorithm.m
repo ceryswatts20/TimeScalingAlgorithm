@@ -1,0 +1,209 @@
+%% Time Scaling Algorithm
+clearvars
+close all
+clear all
+
+% Min joint torques
+min_tau = [-4800; -5000];
+% Max joint torques
+max_tau = [6000; 7000];
+
+%% Plot VLC
+% Inital sdot value
+sdot_0 = 0.25;
+% Lots of s values
+s_star = 0:0.001:1;
+
+% Find sdot for each s
+% arrayfun() applies fsolve() to each s value iteratively.
+sdot_vlc = arrayfun(@(s_star) fsolve(@(sdot) vlcSimulation(min_tau, max_tau, s_star, sdot), sdot_0), s_star);
+
+p = polyfit(s_star, sdot_vlc , 10);
+% Evaluate the polynomial fit at the s_star values
+sdot_fit = polyval(p, s_star);
+sdot_fit = sdot_fit - 0.04;
+% Save Velocity Limit Curve
+vlc = [s_star', sdot_fit'];
+%vlc = [s_star', (0.05 * ones(size(s_star)))'];
+%vlc = [s_star', ((s_star.^2)+10)'];
+%vlc = [s_star', sdot_vlc'];
+
+% Plot the velocity limit curve
+plot(vlc(:, 1), vlc(:, 2), 'DisplayName', 'VLC')
+xlabel('s')
+ylabel('$\dot{s}$', 'Interpreter', 'latex')
+title('Time-scaling Algoritm')
+grid on
+hold on
+
+%% Step 1
+% List of switch points
+S = [];
+% Switch counter
+i = 0;
+% Initial State - (s, sdot) = (0, 0)
+s_i = [0 0];
+% Simulation time
+tspan = [0 10];
+
+%% Step 2 - Integrate sddot = L(s, sdot) from (1, 0)
+% Set event conditions
+backFunc = @(t, x) backwardsStopEvent(t, x, vlc);
+back_options = odeset('Events', backFunc, 'RelTol', 1e-6, 'AbsTol', 1e-8);
+direction = 'backwardMin';
+% [Time, Function Output, Time of events, Solution at events, Index of which event]
+[~, F] = ode45(@(t, x) Simulation(t, x, direction, min_tau, max_tau), tspan, ...
+    [1 0], back_options);
+
+plot(F(end, 1), F(end, 2), 'ko', 'MarkerFaceColor', 'k', 'DisplayName', 'F-VLC');
+
+while true
+    %% Step 3 - Integrate sddot = U(s, sdot) from s_i
+    % Stop if L(s, sdot) = U(s, sdot) or s = 1
+    forwardFunc = @(t, x) forwardsStopEvent(t, x, vlc);
+    for_options = odeset('Events', forwardFunc, 'RelTol', 1e-6, 'AbsTol', 1e-8);
+    direction = 'forwardMax';
+    % [Time, Function Output, Time of events, Solution at events, Index of which event]
+    [~, A, ~, yA, iA] = ode45(@(t, x) Simulation(t, x, direction, min_tau, max_tau), tspan, ...
+        s_i, for_options);
+    %plot(A(:, 1), A(:, 2))
+
+    %% Compare y-values at same x positions
+    % A_F_interp = A y-values @ Fs x values
+    A_F_interp = interp1(A(:, 1), A(:, 2), F(:, 1), 'linear');
+    % If sdot @ F < sdot @ A for the same s then A crossed F
+    A_F_diff = F(:, 2) - A_F_interp;
+    % Find zero crossings (where sign changes) + x + = +, + x - = -, - x - = +
+    % Multiply adjacent elements and check if result is < 0
+    % find() -> returns index of A_F_diff that fulfills the condition
+    A_F_crossing_indx = find(A_F_diff(1:end-1) .* A_F_diff(2:end) < 0);
+
+    % If A crosses F, increment i
+    if size(A_F_crossing_indx) ~= 0
+        % x before crossing
+        before_vlcCrossing_x = F(A_F_crossing_indx,1);
+        % x after crossing
+        after_vlcCrossing_x = F(A_F_crossing_indx+1,1);
+        % y-difference before crossing (F - A)
+        % calculates differences between adjacent elements
+        before_vlcCrossing_y = A_F_diff(A_F_crossing_indx);
+        % y-difference after crossing
+        after_vlcCrossing_y = A_F_diff(A_F_crossing_indx+1);
+
+        % crossing_point — the x-value where diff == 0, i.e. where the curves cross.
+        crossing_point_x = before_vlcCrossing_x - before_vlcCrossing_y * (after_vlcCrossing_x - before_vlcCrossing_x) / (after_vlcCrossing_y - before_vlcCrossing_y);
+        % y-value from F at x_cross
+        crossing_point_y = interp1(F(:,1), F(:,2), crossing_point_x);
+        % Set s_i to the crossing point
+        s_i = [crossing_point_x crossing_point_y];
+        % Append s_i to list of switches S
+        S = [S; s_i];
+
+        % Plot the functions and crossing
+        figure;
+        % Truncate F and A up to crossing point
+        F_trunc = F(1:A_F_crossing_indx, :);
+        A_trunc = A(A(:,1) <= crossing_point_x, :);
+        % Add crossing point to the end
+        F_trunc(end+1,:) = [crossing_point_x, crossing_point_y];
+        A_trunc(end+1,:) = [crossing_point_x, crossing_point_y];
+
+        % F up to intersection
+        plot(F_trunc(:,1), F_trunc(:,2), 'DisplayName', 'F');
+        % A up to intersection
+        plot(A_trunc(:,1), A_trunc(:,2), 'DisplayName', 'A');
+        % F-A crossing point
+        plot(crossing_point_x, crossing_point_y, 'ro', 'MarkerFaceColor', ...
+            'r', 'DisplayName', 's_1');
+
+        % Exit the loop
+        break;
+    else
+        % Save point where VLC is crossed
+        s_lim = A(end, :);
+
+        % Plot F
+        plot(F(:,1), F(:,2), 'DisplayName', 'F');
+
+        %% Step 4 - Binary Search
+        % Initialize binary search parameters
+        tolerance = 1e-2;
+        % sdot_high = sdot_lim
+        sdot_high = s_lim(2);
+        sdot_low = 0;
+
+        % Binary search loop
+        while (sdot_high - sdot_low) > tolerance
+            % Set the initial guess for the binary search
+            sdot_test = (sdot_high + sdot_low) / 2;
+            % Test point
+            test_point = [s_lim(1), sdot_test];
+
+            % Integrate s_ddot = L(s, sdot) forward in time from (s_lim, sdot_test)
+            direction = 'forwardMin';
+            % Set event conditions
+            binaryFunc = @(t, x) binaryForwardsStopEvent(t, x, vlc);
+            binaryForwardOptions = odeset('Events', binaryFunc, 'RelTol', 1e-6, 'AbsTol', 1e-8);
+            [~, A_test, ~, ~, iA] = ode45(@(t, x) Simulation(t, x, direction, min_tau, max_tau), ...
+                tspan, test_point, binaryForwardOptions);
+
+            % Check if the curve crosses vlc
+            if iA == 2
+                % Adjust upper bounds
+                sdot_high = sdot_test;
+            % Check if the curve hits sdot = 0
+            elseif iA == 1
+                % Adjust lower bounds
+                sdot_low = sdot_test;
+            else
+                error('sddot = L(s, sdot) forward in time does not cross vlc or A');
+            end
+        end
+
+        % Final result
+        s_tan = test_point;
+        % plot(s_tan(1), s_tan(2), 'ko')
+        % plot(A_test(:, 1), A_test(:, 2))
+
+        %% Step 5
+        back = @(t, x) backwardsDeccelStopEvent(t, x, A);
+        b_options = odeset('Events', back, 'RelTol', 1e-6, 'AbsTol', 1e-8);
+        direction = 'backwardMin';
+        [~, Ai, ~, yAi, iAi] = ode45(@(t, x) Simulation(t, x, direction, min_tau, max_tau), ...
+                tspan, s_tan, b_options);
+
+        % Increment i
+        i = i + 1;
+        % Save intersection point
+        % s_i = [yAi(1), yAi(2)];
+        s_i = [Ai(end, 1), Ai(end, 2)]
+        % Plot latest switch point
+        plot(s_i(1), s_i(2), 'go', 'MarkerFaceColor', 'g', 'DisplayName', sprintf('s_%d', i));
+
+        plot(Ai(:, 1), Ai(:, 2),'b', 'DisplayName', sprintf('A_%d', i))
+        %plot(Ai(end, 1), Ai(end, 2), 'bo', 'MarkerFaceColor', 'b', 'DisplayName', 's_1')
+        valid_idx = (A(:, 1) <= s_i(1)) & (A(:, 2) <= s_i(2));
+        % Filter A curve to up to intersection point
+        filtered_A = A(valid_idx, :);
+        % Add intersection point filtered curve A
+        filtered_A = [filtered_A; s_i];
+        % Plot the filtered curve A
+        plot(filtered_A(:, 1), filtered_A(:, 2), 'DisplayName', sprintf('A_%d', i - 1))
+        % Append intersection point to list of switches
+        S = [S; s_i(1)];
+
+        %% Step 6
+        % Increment i
+        i = i + 1;
+        % Save tangent point (result of binary search)
+        s_i = s_tan;
+        % Append point to list of switches
+        S = [S; s_i(1)];
+        % Plot latest switch point
+        plot(s_i(1), s_i(2), 'go', 'MarkerFaceColor', 'g', 'DisplayName', sprintf('s_%d', i));
+    end
+end
+
+legend()
+
+
